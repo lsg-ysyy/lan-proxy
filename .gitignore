@@ -1,0 +1,17 @@
+# 编译产物
+lan-proxy.exe
+sea-prep.blob
+dist/
+
+# 临时文件
+log.txt
+problem.txt
+*.log
+
+# 系统文件
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

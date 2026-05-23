@@ -1,0 +1,12 @@
+{
+  "name": "lan-proxy",
+  "version": "1.0.0",
+  "description": "LAN Proxy Forwarder - 二级代理转发工具，将局域网设备流量转发到 Clash Verge",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node src/main.js",
+    "start:verbose": "node src/main.js -v",
+    "start:socks5": "node src/main.js --socks5 0.0.0.0:8081",
+    "build": "node scripts/build.js"
+  }
+}
