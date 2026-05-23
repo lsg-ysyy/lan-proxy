@@ -12,7 +12,7 @@
  */
 
 const { parseArgs } = require('./config');
-const { log, getLocalIPs, parseAddr, activeConns } = require('./utils');
+const { log, getLocalIPs, parseAddr, activeConns, startUpstreamCheck } = require('./utils');
 const { createHTTPProxy } = require('./http-proxy');
 const { createSOCKS5Server } = require('./socks5-proxy');
 
@@ -41,6 +41,10 @@ function main() {
     }
   }
   console.log('');
+
+  // 启动上游代理健康检查
+  const [upHost, upPort] = parseAddr(config.upstream);
+  startUpstreamCheck(upHost, upPort);
 
   // 启动 HTTP 代理服务器
   const httpServer = createHTTPProxy(config);

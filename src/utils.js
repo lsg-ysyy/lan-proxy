@@ -1,13 +1,55 @@
 'use strict';
 
+const net = require('net');
+
 // 共享连接计数器，所有模块通过引用访问同一个对象
 const activeConns = { value: 0 };
 const totalConns = { value: 0 };
+
+// 上游代理在线状态
+const upstreamOnline = { value: true };
 
 /** 带时间戳的日志输出 */
 function log(tag, msg) {
   const ts = new Date().toLocaleString('zh-CN', { hour12: false });
   console.log(`[${ts}] [${tag}] ${msg}`);
+}
+
+/**
+ * 上游代理健康检查
+ * 每 10 秒 TCP 连接上游端口，成功则 online，失败则 offline
+ * 状态变化时打印日志
+ */
+function startUpstreamCheck(host, port) {
+  const check = () => {
+    const socket = net.connect(port, host);
+    socket.setTimeout(3000);
+    socket.on('connect', () => {
+      socket.destroy();
+      if (!upstreamOnline.value) {
+        upstreamOnline.value = true;
+        log('FALLBACK', `上游已恢复 (${host}:${port})，切换为代理模式`);
+      }
+    });
+    socket.on('error', () => {
+      if (upstreamOnline.value) {
+        upstreamOnline.value = false;
+        log('FALLBACK', `上游不可用 (${host}:${port})，切换为直连模式`);
+      }
+    });
+    socket.on('timeout', () => {
+      socket.destroy();
+      if (upstreamOnline.value) {
+        upstreamOnline.value = false;
+        log('FALLBACK', `上游超时 (${host}:${port})，切换为直连模式`);
+      }
+    });
+  };
+
+  // 首次检查
+  check();
+  // 定期检查
+  setInterval(check, 10000);
 }
 
 /** 将字节数格式化为人类可读字符串 */
@@ -78,5 +120,6 @@ function parseAddr(addr) {
 
 module.exports = {
   log, formatBytes, getClientIP, isPrivateIP, getLocalIPs, parseAddr,
+  startUpstreamCheck, upstreamOnline,
   activeConns, totalConns,
 };

@@ -1,23 +1,21 @@
 'use strict';
 
 const net = require('net');
-const { log, getClientIP, isPrivateIP, parseAddr, activeConns } = require('./utils');
+const { log, getClientIP, isPrivateIP, parseAddr, activeConns, upstreamOnline } = require('./utils');
+
+/**
+ * 解析 SOCKS5 请求中的目标地址为 host:port
+ */
+function parseTarget(url) {
+  const i = url.lastIndexOf(':');
+  return { host: url.slice(0, i), port: parseInt(url.slice(i + 1)) };
+}
 
 /**
  * 创建 SOCKS5 代理服务器
  *
  * 将 SOCKS5 协议转换为 HTTP CONNECT 请求，通过上游代理转发。
- * 这样设备可以使用 SOCKS5 协议连接本工具，而实际流量仍走 Clash Verge。
- *
- * SOCKS5 协议流程：
- *   1. 客户端发送版本号 + 支持的认证方法列表
- *   2. 服务端选择认证方法（本工具选择 0x00 = 无需认证）
- *   3. 客户端发送连接请求（目标地址 + 端口）
- *   4. 服务端建立连接并返回结果
- *   5. 双向透传数据
- *
- * 支持的目标地址类型：IPv4 (0x01)、域名 (0x03)、IPv6 (0x04)
- * 仅支持 CONNECT 命令 (0x01)，不支持 BIND 和 UDP ASSOCIATE
+ * 上游不可用时，直连目标服务器。
  *
  * @param {object} config - 配置对象
  * @returns {net.Server}
@@ -35,10 +33,9 @@ function createSOCKS5Server(config) {
       return;
     }
 
-    // 使用状态机解析 SOCKS5 协议
-    let state = 'handshake';  // handshake -> request -> relay
-    let target = '';           // 目标地址 (host:port)
-    let buf = Buffer.alloc(0); // 接收缓冲区
+    let state = 'handshake';
+    let target = '';
+    let buf = Buffer.alloc(0);
 
     socket.on('data', (chunk) => {
       buf = Buffer.concat([buf, chunk]);
@@ -46,22 +43,19 @@ function createSOCKS5Server(config) {
     });
     socket.on('error', () => { /* 忽略连接错误 */ });
 
-    /** 状态机：按 SOCKS5 协议逐步解析数据 */
     function process() {
-      // ---- 阶段1：认证协商 ----
       if (state === 'handshake') {
         if (buf.length < 2) return;
         if (buf[0] !== 0x05) { socket.destroy(); return; }
         const n = buf[1];
         if (buf.length < 2 + n) return;
         buf = buf.slice(2 + n);
-        socket.write(Buffer.from([0x05, 0x00])); // 无需认证
+        socket.write(Buffer.from([0x05, 0x00]));
         state = 'request';
         process();
         return;
       }
 
-      // ---- 阶段2：连接请求 ----
       if (state === 'request') {
         if (buf.length < 4) return;
 
@@ -73,9 +67,9 @@ function createSOCKS5Server(config) {
 
         let addrLen;
         switch (buf[3]) {
-          case 0x01: addrLen = 4; break;           // IPv4
-          case 0x03: addrLen = 1 + buf[4]; break;  // 域名
-          case 0x04: addrLen = 16; break;           // IPv6
+          case 0x01: addrLen = 4; break;
+          case 0x03: addrLen = 1 + buf[4]; break;
+          case 0x04: addrLen = 16; break;
           default:
             socket.write(Buffer.from([0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
             socket.destroy();
@@ -111,11 +105,33 @@ function createSOCKS5Server(config) {
       }
     }
 
-    /**
-     * 通过上游 HTTP 代理建立连接
-     * 将 SOCKS5 的目标地址转换为 HTTP CONNECT 请求发送给 Clash Verge
-     */
     function connectUpstream() {
+      // 上游不可用时，直连目标服务器
+      if (!upstreamOnline.value) {
+        const t = parseTarget(target);
+        const direct = net.connect(t.port, t.host);
+        direct.setNoDelay(true);
+        direct.setKeepAlive(true, 30000);
+
+        direct.on('connect', () => {
+          socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+          socket.removeAllListeners('data');
+          if (buf.length > 0) direct.write(buf);
+          direct.pipe(socket);
+          socket.pipe(direct);
+        });
+
+        direct.on('error', () => {
+          log('ERR', `${ip}:${clientPort} SOCKS5 ${target} 直连失败`);
+          socket.write(Buffer.from([0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+          socket.destroy();
+        });
+
+        socket.on('close', () => { direct.destroy(); });
+        return;
+      }
+
+      // 上游可用时，通过上游代理建立连接
       const upstream = net.connect(upPort, upHost);
       upstream.setNoDelay(true);
       upstream.setKeepAlive(true, 30000);
@@ -144,13 +160,11 @@ function createSOCKS5Server(config) {
           return;
         }
 
-        // SOCKS5 成功响应
         socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
 
         const rest = hBuf.slice(i + 4);
         if (rest.length > 0) socket.write(rest);
 
-        // 切换为双向透传模式
         socket.removeAllListeners('data');
         upstream.removeAllListeners('data');
 

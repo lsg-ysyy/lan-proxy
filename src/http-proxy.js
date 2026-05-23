@@ -2,14 +2,23 @@
 
 const http = require('http');
 const net = require('net');
-const { log, formatBytes, getClientIP, isPrivateIP, parseAddr, activeConns, totalConns } = require('./utils');
+const { log, formatBytes, getClientIP, isPrivateIP, parseAddr, activeConns, totalConns, upstreamOnline } = require('./utils');
+
+/**
+ * 解析 CONNECT 请求中的目标地址
+ * CONNECT example.com:443 → { host: 'example.com', port: 443 }
+ */
+function parseTarget(url) {
+  const i = url.lastIndexOf(':');
+  return { host: url.slice(0, i), port: parseInt(url.slice(i + 1)) };
+}
 
 /**
  * 创建 HTTP 代理服务器
  *
  * 处理两种请求：
- * 1. 普通 HTTP 请求：直接转发到上游代理（Clash Verge）
- * 2. CONNECT 请求（HTTPS）：与上游建立隧道，双向透传数据
+ * 1. 普通 HTTP 请求：转发到上游代理，上游不可用时直连目标服务器
+ * 2. CONNECT 请求（HTTPS）：通过上游建立隧道，上游不可用时直连目标服务器
  *
  * @param {object} config - 配置对象
  * @returns {http.Server}
@@ -30,6 +39,32 @@ function createHTTPProxy(config) {
 
     const clientPort = req.socket.remotePort;
 
+    // 上游不可用时，直连目标服务器
+    if (!upstreamOnline.value) {
+      const directReq = http.request(req.url, {
+        method: req.method,
+        headers: req.headers,
+      }, (directRes) => {
+        res.writeHead(directRes.statusCode, directRes.headers);
+        directRes.pipe(res);
+        let bytes = 0;
+        directRes.on('data', (c) => { bytes += c.length; });
+        directRes.on('end', () => {
+          log('DIRECT', `${ip}:${clientPort} ${req.method} ${req.headers.host || req.url} -> ${directRes.statusCode} (${formatBytes(bytes)})`);
+        });
+      });
+      directReq.on('error', (err) => {
+        log('ERR', `${ip}:${clientPort} ${req.method} ${req.url} 直连失败: ${err.message}`);
+        if (!res.headersSent) {
+          res.writeHead(502);
+          res.end('Bad Gateway');
+        }
+      });
+      req.pipe(directReq);
+      return;
+    }
+
+    // 上游可用时，转发到上游代理
     const proxyReq = http.request({
       host: upHost,
       port: upPort,
@@ -58,12 +93,6 @@ function createHTTPProxy(config) {
   });
 
   // ---- HTTPS CONNECT 隧道处理 ----
-  // 流程：
-  //   1. 本工具连接到 Clash Verge
-  //   2. 向 Clash Verge 转发 CONNECT example.com:443
-  //   3. Clash Verge 与目标服务器建立 TCP 连接，返回 200
-  //   4. 本工具向手机返回 200
-  //   5. 双向透传：手机 <--> 本工具(pipe) <--> Clash Verge <--> 目标服务器
   server.on('connect', (req, client, head) => {
     const ip = getClientIP(client);
     const clientPort = client.remotePort;
@@ -79,6 +108,34 @@ function createHTTPProxy(config) {
     totalConns.value++;
     const id = totalConns.value;
 
+    // 上游不可用时，直连目标服务器
+    if (!upstreamOnline.value) {
+      const target = parseTarget(req.url);
+      const direct = net.connect(target.port, target.host);
+      direct.setNoDelay(true);
+      direct.setKeepAlive(true, 30000);
+
+      direct.on('connect', () => {
+        log('DIRECT', `#${id} ${ip}:${clientPort} -> ${req.url} (${activeConns.value} active)`);
+        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        if (head.length > 0) direct.write(head);
+        direct.pipe(client);
+        client.pipe(direct);
+      });
+
+      direct.on('error', () => {
+        log('ERR', `#${id} ${ip}:${clientPort} 直连 ${req.url} 失败`);
+        client.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+        client.destroy();
+        activeConns.value--;
+      });
+
+      client.on('error', () => { direct.destroy(); activeConns.value--; });
+      client.on('close', () => { direct.destroy(); activeConns.value--; });
+      return;
+    }
+
+    // 上游可用时，通过上游代理建立隧道
     const upstream = net.connect(upPort, upHost);
     upstream.setNoDelay(true);
     upstream.setKeepAlive(true, 30000);
